@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gguf_surgeon::{GgufFile, GgufValue, GgufValueType, SavePath};
+use gguf_surgeon::{Error, GgufFile, GgufValue, GgufValueType, SavePath};
 
 fn put_str(b: &mut Vec<u8>, s: &[u8]) {
     b.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -182,6 +182,37 @@ fn padded_file_uses_header_overwrite_for_subsequent_same_size_edits() {
         f3.metadata.iter().find(|(k, _)| k == "answer").unwrap().1,
         GgufValue::Uint32(7)
     );
+}
+
+#[test]
+fn write_refuses_to_produce_a_file_with_duplicate_keys() {
+    let path = temp_path("dup.gguf");
+    let _cleanup = Cleanup(vec![path.clone(), tmp_for(&path)]);
+
+    std::fs::write(&path, build_file_with_tensor_data()).unwrap();
+
+    let mut f = GgufFile::read(&path).unwrap();
+    // Inject a duplicate of an existing key — would produce an unloadable file.
+    let dup_key = f.metadata[0].0.clone();
+    let dup_value = f.metadata[0].1.clone();
+    f.metadata.push((dup_key.clone(), dup_value));
+
+    let err = f.write(&path, &path).unwrap_err();
+    assert!(
+        matches!(err, Error::FormatViolation(_)),
+        "expected FormatViolation, got {err:?}"
+    );
+
+    // The file on disk must be untouched: still parses cleanly without the duplicate.
+    let still_clean = GgufFile::read(&path).unwrap();
+    let count_of_dup = still_clean
+        .metadata
+        .iter()
+        .filter(|(k, _)| k == &dup_key)
+        .count();
+    assert_eq!(count_of_dup, 1, "the original file should be unchanged");
+    // And no temp file left behind.
+    assert!(!tmp_for(&path).exists(), "temp file should be cleaned up");
 }
 
 #[test]

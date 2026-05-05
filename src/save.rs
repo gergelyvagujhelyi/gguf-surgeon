@@ -40,6 +40,10 @@ impl GgufFile {
     /// Also adjusts the `general.padding` sentinel so the encoded header rounds up to the
     /// default 64 KB slack budget — subsequent small edits then take the header-overwrite path.
     pub fn write(&mut self, source: &Path, dest: &Path) -> Result<(), Error> {
+        // Refuse to write a file that would not load (e.g. duplicate keys). The CLI's
+        // `finalize` already runs this check, but enforcing it here protects library
+        // consumers and guarantees no path through `write` can produce an invalid file.
+        self.check_format()?;
         self.ensure_padding(DEFAULT_PADDING_STEP);
         let header = self.encode_header();
         if header.len() as u64 == self.tensor_data_offset {

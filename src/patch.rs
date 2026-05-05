@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::format::GgufFile;
+use crate::format::{GgufFile, is_reserved_key};
 use crate::value::{GgufArray, GgufValue, GgufValueType};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +36,12 @@ pub fn apply(file: &mut GgufFile, patch: &Patch) -> Result<()> {
 }
 
 fn apply_one(file: &mut GgufFile, op: &Op) -> Result<()> {
+    let target_key = match op {
+        Op::Set { key, .. } | Op::Add { key, .. } | Op::Rm { key } => key.as_str(),
+    };
+    if is_reserved_key(target_key) {
+        bail!("`{target_key}` is managed automatically by the editor; cannot be edited via patch");
+    }
     match op {
         Op::Set { key, value } => {
             let pos = file
@@ -254,5 +260,53 @@ mod tests {
         };
         let patch = parse_patch(r#"[{"op": "set", "key": "x", "value": 1}]"#).unwrap();
         assert!(apply(&mut f, &patch).is_err());
+    }
+
+    fn empty_file() -> GgufFile {
+        GgufFile {
+            version: 3,
+            tensor_count: 0,
+            metadata: vec![],
+            tensors: vec![],
+            alignment: 32,
+            header_end: 0,
+            tensor_data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn rejects_set_on_reserved_key() {
+        let mut f = empty_file();
+        f.metadata.push((
+            "general.padding".to_string(),
+            GgufValue::Uint32(0),
+        ));
+        let patch =
+            parse_patch(r#"[{"op": "set", "key": "general.padding", "value": 1}]"#).unwrap();
+        let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
+        assert!(err.contains("managed automatically"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn rejects_add_on_reserved_key() {
+        let mut f = empty_file();
+        let patch = parse_patch(
+            r#"[{"op": "add", "key": "general.padding", "type": "u32", "value": 1}]"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
+        assert!(err.contains("managed automatically"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn rejects_rm_on_reserved_key() {
+        let mut f = empty_file();
+        f.metadata.push((
+            "general.padding".to_string(),
+            GgufValue::Uint32(0),
+        ));
+        let patch = parse_patch(r#"[{"op": "rm", "key": "general.padding"}]"#).unwrap();
+        let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
+        assert!(err.contains("managed automatically"), "unexpected err: {err}");
     }
 }

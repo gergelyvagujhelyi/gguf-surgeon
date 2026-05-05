@@ -56,6 +56,22 @@ fn align_up(n: u64, align: u64) -> u64 {
     n.div_ceil(align) * align
 }
 
+/// Cap an attacker-controlled count so `Vec::with_capacity` cannot be tricked into
+/// allocating gigabytes from a malformed file. The Vec grows naturally as elements
+/// are pushed; the bounds check inside the per-element read terminates the loop on
+/// real truncation, so total memory stays bounded by what's actually in the file.
+const SAFE_CAPACITY_HINT: usize = 4096;
+
+fn safe_capacity(declared: u64) -> usize {
+    declared.min(SAFE_CAPACITY_HINT as u64) as usize
+}
+
+/// Reserved metadata keys that the editor manages internally. Users cannot edit them
+/// directly; they are filtered out of user-facing displays.
+pub fn is_reserved_key(key: &str) -> bool {
+    key == PADDING_KEY
+}
+
 fn alignment_from_metadata(metadata: &[(String, GgufValue)]) -> u64 {
     metadata
         .iter()
@@ -99,7 +115,7 @@ impl GgufFile {
             });
         }
 
-        let mut metadata = Vec::with_capacity(kv_count as usize);
+        let mut metadata = Vec::with_capacity(safe_capacity(kv_count));
         for _ in 0..kv_count {
             let key = r.string()?;
             let ty_tag = r.u32()?;
@@ -114,7 +130,7 @@ impl GgufFile {
                 remaining: r.remaining() as u64,
             });
         }
-        let mut tensors = Vec::with_capacity(tensor_count as usize);
+        let mut tensors = Vec::with_capacity(safe_capacity(tensor_count));
         for _ in 0..tensor_count {
             tensors.push(r.tensor_info()?);
         }
@@ -189,6 +205,25 @@ impl GgufFile {
             }
         }
         out
+    }
+
+    /// Return Err if format-level validation finds any error-severity violations.
+    /// Used internally by `write()` to refuse producing an invalid file.
+    pub fn check_format(&self) -> Result<(), Error> {
+        let violations = self.validate_format();
+        let errors: Vec<_> = violations
+            .iter()
+            .filter(|v| v.severity == Severity::Error)
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let summary = errors
+            .iter()
+            .map(|v| format!("{}: {}", v.key, v.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(Error::FormatViolation(summary))
     }
 
     /// Encode the header region (magic through minimum alignment padding) into a byte vector.
@@ -346,7 +381,7 @@ impl<'a> Reader<'a> {
                 remaining: self.remaining() as u64,
             });
         }
-        let mut elements = Vec::with_capacity(len as usize);
+        let mut elements = Vec::with_capacity(safe_capacity(len));
         for _ in 0..len {
             elements.push(self.value(element_type)?);
         }
@@ -365,7 +400,7 @@ impl<'a> Reader<'a> {
                 remaining: self.remaining() as u64,
             });
         }
-        let mut dims = Vec::with_capacity(n_dims as usize);
+        let mut dims = Vec::with_capacity(safe_capacity(n_dims));
         for _ in 0..n_dims {
             dims.push(self.u64()?);
         }
@@ -725,6 +760,72 @@ mod tests {
             tensor_data_offset: 0,
         };
         assert!(f.validate_format().is_empty());
+    }
+
+    #[test]
+    fn safe_capacity_caps_attacker_controlled_count() {
+        assert_eq!(safe_capacity(0), 0);
+        assert_eq!(safe_capacity(100), 100);
+        assert_eq!(safe_capacity(SAFE_CAPACITY_HINT as u64), SAFE_CAPACITY_HINT);
+        // The headline case: a malformed file declaring billions of elements must not be
+        // allowed to request gigabytes of pre-allocation.
+        assert_eq!(safe_capacity(1_000_000_000), SAFE_CAPACITY_HINT);
+        assert_eq!(safe_capacity(u64::MAX), SAFE_CAPACITY_HINT);
+    }
+
+    #[test]
+    fn parser_handles_huge_declared_count_without_pre_allocating() {
+        // Declare a giant kv_count (1M) but provide only a handful of bytes after the header.
+        // The parser must error on truncation, not allocate proportional to the declaration.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&1_000_000u64.to_le_bytes()); // kv_count: pretend we have 1M entries
+        // ... but no entries follow.
+        let err = GgufFile::parse(&b).unwrap_err();
+        assert!(matches!(err, Error::OversizedDeclaration { .. } | Error::Truncated { .. }));
+    }
+
+    #[test]
+    fn is_reserved_key_recognises_padding() {
+        assert!(is_reserved_key(PADDING_KEY));
+        assert!(is_reserved_key("general.padding"));
+        assert!(!is_reserved_key("general.architecture"));
+        assert!(!is_reserved_key(""));
+        assert!(!is_reserved_key("general.padding.suffix"));
+    }
+
+    #[test]
+    fn check_format_returns_error_for_duplicate_keys() {
+        let f = GgufFile {
+            version: 3,
+            tensor_count: 0,
+            metadata: vec![
+                ("a".to_string(), GgufValue::Uint32(1)),
+                ("a".to_string(), GgufValue::Uint32(2)),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            header_end: 0,
+            tensor_data_offset: 0,
+        };
+        let err = f.check_format().unwrap_err();
+        assert!(matches!(err, Error::FormatViolation(_)));
+    }
+
+    #[test]
+    fn check_format_passes_clean_file() {
+        let f = GgufFile {
+            version: 3,
+            tensor_count: 0,
+            metadata: vec![("a".to_string(), GgufValue::Uint32(1))],
+            tensors: vec![],
+            alignment: 32,
+            header_end: 0,
+            tensor_data_offset: 0,
+        };
+        assert!(f.check_format().is_ok());
     }
 
     fn header_v(version: u32, tensor_count: u64, kv_count: u64) -> Vec<u8> {

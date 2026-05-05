@@ -19,7 +19,7 @@ use ratatui::{
 };
 
 use crate::diff::Diff;
-use crate::format::GgufFile;
+use crate::format::{GgufFile, is_reserved_key};
 use crate::value::{GgufValue, GgufValueType};
 
 const ARRAY_DETAIL_LIMIT: usize = 200;
@@ -101,7 +101,13 @@ enum Mode {
 impl App {
     fn new(file: GgufFile, path: PathBuf, file_size: u64) -> Self {
         let original_metadata = file.metadata.clone();
-        let visible: Vec<usize> = (0..file.metadata.len()).collect();
+        let visible: Vec<usize> = file
+            .metadata
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| !is_reserved_key(k))
+            .map(|(i, _)| i)
+            .collect();
         let mut list_state = TableState::default();
         if !visible.is_empty() {
             list_state.select(Some(0));
@@ -325,17 +331,15 @@ impl App {
 
     fn refilter(&mut self) {
         let q = self.search_buf.to_lowercase();
-        self.visible = if q.is_empty() {
-            (0..self.file.metadata.len()).collect()
-        } else {
-            self.file
-                .metadata
-                .iter()
-                .enumerate()
-                .filter(|(_, (k, _))| k.to_lowercase().contains(&q))
-                .map(|(i, _)| i)
-                .collect()
-        };
+        self.visible = self
+            .file
+            .metadata
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| !is_reserved_key(k))
+            .filter(|(_, (k, _))| q.is_empty() || k.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect();
         self.set_cursor(0);
     }
 }

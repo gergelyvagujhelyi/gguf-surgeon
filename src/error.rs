@@ -25,4 +25,7 @@ pub enum Error {
 
     #[error("declared size {declared} exceeds remaining file bytes {remaining}")]
     OversizedDeclaration { declared: u64, remaining: u64 },
+
+    #[error("format violation: {0}")]
+    FormatViolation(String),
 }

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use gguf_surgeon::{
     Diff, GgufFile, GgufValue, GgufValueType, Origin, SavePath, Schema, Severity, Violation,
-    apply_patch, parse_patch,
+    apply_patch, is_reserved_key, parse_patch,
 };
 
 #[derive(Parser)]
@@ -133,23 +133,28 @@ struct Env<'a> {
 
 fn list(path: &Path, max_value_width: usize) -> Result<()> {
     let f = GgufFile::read(path)?;
+    let visible: Vec<&(String, GgufValue)> = f
+        .metadata
+        .iter()
+        .filter(|(k, _)| !is_reserved_key(k))
+        .collect();
+
     println!("# {} (GGUF v{})", path.display(), f.version);
     println!(
         "# {} tensors, {} metadata entries",
         f.tensor_count,
-        f.metadata.len()
+        visible.len()
     );
     println!();
 
-    let key_w = f.metadata.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    let type_w = f
-        .metadata
+    let key_w = visible.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let type_w = visible
         .iter()
         .map(|(_, v)| v.ty().as_str().len())
         .max()
         .unwrap_or(0);
 
-    for (key, value) in &f.metadata {
+    for (key, value) in &visible {
         let summary = summarize(value, max_value_width);
         println!(
             "{key:<key_w$}  {ty:<type_w$}  {summary}",
@@ -190,6 +195,9 @@ fn format_string(s: &str, max_width: usize) -> String {
 }
 
 fn get(path: &Path, key: &str, limit: Option<usize>) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!("`{key}` is managed automatically by the editor and is not user-visible");
+    }
     let f = GgufFile::read(path)?;
     let Some((_, value)) = f.metadata.iter().find(|(k, _)| k == key) else {
         bail!("key not found: {key}");
@@ -247,6 +255,9 @@ fn print_inline(value: &GgufValue) {
 }
 
 fn set(path: &Path, key: &str, raw_value: &str, yes: bool, env: &Env) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!("`{key}` is managed automatically by the editor; cannot be edited");
+    }
     let mut f = GgufFile::read(path)?;
     let pos = f
         .metadata
@@ -263,6 +274,9 @@ fn set(path: &Path, key: &str, raw_value: &str, yes: bool, env: &Env) -> Result<
 }
 
 fn add(path: &Path, key: &str, ty_name: &str, raw_value: &str, yes: bool, env: &Env) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!("`{key}` is reserved by the editor; pick a different key name");
+    }
     let mut f = GgufFile::read(path)?;
     if f.metadata.iter().any(|(k, _)| k == key) {
         bail!("key already exists: {key} (use `gguf set` to modify it)");
@@ -281,6 +295,9 @@ fn add(path: &Path, key: &str, ty_name: &str, raw_value: &str, yes: bool, env: &
 }
 
 fn rm(path: &Path, key: &str, yes: bool, env: &Env) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!("`{key}` is managed automatically by the editor; cannot be removed");
+    }
     let mut f = GgufFile::read(path)?;
     let pos = f
         .metadata
