@@ -18,10 +18,15 @@ const PADDING_KEY: &str = "general.padding";
 /// this value so subsequent edits within the budget can use the header-overwrite save path.
 pub const DEFAULT_PADDING_STEP: u64 = 64 * 1024;
 
-/// Encoded byte overhead of the sentinel padding key itself (key length prefix + key bytes
-/// + value type tag + array element type + array length prefix). The actual byte count
-/// of zeros is appended on top of this.
-const PADDING_OVERHEAD: u64 = 8 + 15 + 4 + 4 + 8;
+/// Length in bytes of "general.padding" (the sentinel key name).
+const PADDING_KEY_LEN: u64 = 15;
+
+/// Encoded byte overhead of the sentinel padding key itself, given the file version.
+/// (key length prefix + key bytes + value type tag + array element type + array length prefix)
+fn padding_overhead(version: u32) -> u64 {
+    let cp = version::count_prefix_bytes(version);
+    cp + PADDING_KEY_LEN + 4 + 4 + cp
+}
 
 #[derive(Debug, Clone)]
 pub struct GgufFile {
@@ -82,9 +87,10 @@ impl GgufFile {
                 supported: version::SUPPORTED_VERSIONS,
             });
         }
+        r.version = version;
 
-        let tensor_count = r.u64()?;
-        let kv_count = r.u64()?;
+        let tensor_count = r.count()?;
+        let kv_count = r.count()?;
 
         if kv_count > r.remaining() as u64 {
             return Err(Error::OversizedDeclaration {
@@ -139,7 +145,8 @@ impl GgufFile {
             return;
         }
         let raw = self.encoded_size_unaligned();
-        let min_total_with_padding = raw + PADDING_OVERHEAD;
+        let overhead = padding_overhead(self.version);
+        let min_total_with_padding = raw + overhead;
         let target = min_total_with_padding.div_ceil(step) * step;
         let zeros = (target - min_total_with_padding) as usize;
         let elements = std::iter::repeat_n(GgufValue::Uint8(0), zeros).collect();
@@ -154,12 +161,13 @@ impl GgufFile {
 
     /// Size in bytes of the metadata block + tensor_info table, before alignment padding.
     pub fn encoded_size_unaligned(&self) -> u64 {
-        let mut size: u64 = 4 + 4 + 8 + 8;
+        let cp = version::count_prefix_bytes(self.version);
+        let mut size: u64 = 4 + 4 + cp + cp; // magic + version + tensor_count + kv_count
         for (k, v) in &self.metadata {
-            size += 8 + k.len() as u64 + 4 + value_encoded_size(v);
+            size += cp + k.len() as u64 + 4 + value_encoded_size(v, self.version);
         }
         for t in &self.tensors {
-            size += 8 + t.name.len() as u64 + 4 + 8 * t.dims.len() as u64 + 4 + 8;
+            size += cp + t.name.len() as u64 + 4 + 8 * t.dims.len() as u64 + 4 + 8;
         }
         size
     }
@@ -190,11 +198,11 @@ impl GgufFile {
     pub fn encode_header(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
-            let mut w = Writer::new(&mut out);
+            let mut w = Writer::new(&mut out, self.version);
             w.bytes(MAGIC);
             w.u32(self.version);
-            w.u64(self.tensors.len() as u64);
-            w.u64(self.metadata.len() as u64);
+            w.count(self.tensors.len() as u64);
+            w.count(self.metadata.len() as u64);
             for (key, value) in &self.metadata {
                 w.string(key);
                 w.u32(value.ty() as u32);
@@ -221,11 +229,18 @@ impl GgufFile {
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    /// 0 until the version field is read; then the file's declared version.
+    /// Determines whether length prefixes are u32 (v1) or u64 (v2/v3).
+    version: u32,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            version: 0,
+        }
     }
 
     fn pos(&self) -> usize {
@@ -245,6 +260,14 @@ impl<'a> Reader<'a> {
         let s = &self.data[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
+    }
+
+    fn count(&mut self) -> Result<u64, Error> {
+        if self.version == 1 {
+            Ok(u64::from(self.u32()?))
+        } else {
+            self.u64()
+        }
     }
 
     fn u8(&mut self) -> Result<u8, Error> {
@@ -282,7 +305,7 @@ impl<'a> Reader<'a> {
     }
 
     fn string(&mut self) -> Result<String, Error> {
-        let len = self.u64()?;
+        let len = self.count()?;
         if len > self.remaining() as u64 {
             return Err(Error::OversizedDeclaration {
                 declared: len,
@@ -316,7 +339,7 @@ impl<'a> Reader<'a> {
         let elem_tag = self.u32()?;
         let element_type =
             GgufValueType::from_u32(elem_tag).ok_or(Error::UnknownValueType(elem_tag))?;
-        let len = self.u64()?;
+        let len = self.count()?;
         if len > self.remaining() as u64 {
             return Err(Error::OversizedDeclaration {
                 declared: len,
@@ -357,26 +380,35 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn value_encoded_size(v: &GgufValue) -> u64 {
+fn value_encoded_size(v: &GgufValue, version: u32) -> u64 {
+    let cp = version::count_prefix_bytes(version);
     match v {
         GgufValue::Uint8(_) | GgufValue::Int8(_) | GgufValue::Bool(_) => 1,
         GgufValue::Uint16(_) | GgufValue::Int16(_) => 2,
         GgufValue::Uint32(_) | GgufValue::Int32(_) | GgufValue::Float32(_) => 4,
         GgufValue::Uint64(_) | GgufValue::Int64(_) | GgufValue::Float64(_) => 8,
-        GgufValue::String(s) => 8 + s.len() as u64,
-        GgufValue::Array(a) => {
-            4 + 8 + a.elements.iter().map(value_encoded_size).sum::<u64>()
-        }
+        GgufValue::String(s) => cp + s.len() as u64,
+        GgufValue::Array(a) => 4 + cp + a.elements.iter().map(|e| value_encoded_size(e, version)).sum::<u64>(),
     }
 }
 
 struct Writer<'a> {
     out: &'a mut Vec<u8>,
+    version: u32,
 }
 
 impl<'a> Writer<'a> {
-    fn new(out: &'a mut Vec<u8>) -> Self {
-        Self { out }
+    fn new(out: &'a mut Vec<u8>, version: u32) -> Self {
+        Self { out, version }
+    }
+
+    fn count(&mut self, n: u64) {
+        if self.version == 1 {
+            let n32: u32 = n.try_into().expect("v1 count fits in u32");
+            self.u32(n32);
+        } else {
+            self.u64(n);
+        }
     }
 
     fn bytes(&mut self, b: &[u8]) {
@@ -417,7 +449,7 @@ impl<'a> Writer<'a> {
     }
 
     fn string(&mut self, s: &str) {
-        self.u64(s.len() as u64);
+        self.count(s.len() as u64);
         self.bytes(s.as_bytes());
     }
 
@@ -434,7 +466,7 @@ impl<'a> Writer<'a> {
             GgufValue::String(s) => self.string(s),
             GgufValue::Array(a) => {
                 self.u32(a.element_type as u32);
-                self.u64(a.elements.len() as u64);
+                self.count(a.elements.len() as u64);
                 for e in &a.elements {
                     self.value(e);
                 }
@@ -693,6 +725,103 @@ mod tests {
             tensor_data_offset: 0,
         };
         assert!(f.validate_format().is_empty());
+    }
+
+    fn header_v(version: u32, tensor_count: u64, kv_count: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&version.to_le_bytes());
+        if version == 1 {
+            b.extend_from_slice(&(tensor_count as u32).to_le_bytes());
+            b.extend_from_slice(&(kv_count as u32).to_le_bytes());
+        } else {
+            b.extend_from_slice(&tensor_count.to_le_bytes());
+            b.extend_from_slice(&kv_count.to_le_bytes());
+        }
+        b
+    }
+
+    fn put_str_v(b: &mut Vec<u8>, s: &[u8], version: u32) {
+        if version == 1 {
+            b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        } else {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        }
+        b.extend_from_slice(s);
+    }
+
+    #[test]
+    fn parses_v2_file_with_same_layout_as_v3() {
+        let mut b = header_v(2, 0, 1);
+        put_str(&mut b, b"answer");
+        b.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+        b.extend_from_slice(&42u32.to_le_bytes());
+        let f = GgufFile::parse(&b).expect("parse v2");
+        assert_eq!(f.version, 2);
+        assert_eq!(f.metadata.len(), 1);
+        assert_eq!(f.metadata[0].1, GgufValue::Uint32(42));
+
+        // Round-trip: v2 file encodes back as v2.
+        let encoded = f.encode_header();
+        let f2 = GgufFile::parse(&encoded).expect("re-parse v2");
+        assert_eq!(f2.version, 2);
+        assert_eq!(f2.metadata, f.metadata);
+    }
+
+    #[test]
+    fn parses_v1_file_with_u32_length_prefixes() {
+        let mut b = header_v(1, 0, 2);
+
+        // kv 1: ("name", string, "llama")
+        put_str_v(&mut b, b"name", 1);
+        b.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+        put_str_v(&mut b, b"llama", 1);
+
+        // kv 2: ("ctx", uint32, 4096)
+        put_str_v(&mut b, b"ctx", 1);
+        b.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+        b.extend_from_slice(&4096u32.to_le_bytes());
+
+        let f = GgufFile::parse(&b).expect("parse v1");
+        assert_eq!(f.version, 1);
+        assert_eq!(f.metadata.len(), 2);
+        assert_eq!(f.metadata[0].0, "name");
+        assert_eq!(f.metadata[0].1, GgufValue::String("llama".to_string()));
+        assert_eq!(f.metadata[1].1, GgufValue::Uint32(4096));
+    }
+
+    #[test]
+    fn v1_round_trip_byte_identical() {
+        let mut original = header_v(1, 0, 1);
+        put_str_v(&mut original, b"k", 1);
+        original.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes());
+        original.extend_from_slice(&7u32.to_le_bytes());
+        // Pad to default alignment 32.
+        let pad = (32 - original.len() % 32) % 32;
+        original.extend(std::iter::repeat_n(0u8, pad));
+
+        let f = GgufFile::parse(&original).expect("parse");
+        let encoded = f.encode_header();
+        assert_eq!(encoded, original, "v1 round-trip must preserve byte layout");
+    }
+
+    #[test]
+    fn v1_array_uses_u32_length_prefix() {
+        let mut b = header_v(1, 0, 1);
+        put_str_v(&mut b, b"shape", 1);
+        b.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        b.extend_from_slice(&(GgufValueType::Uint32 as u32).to_le_bytes()); // element type
+        b.extend_from_slice(&3u32.to_le_bytes()); // length, u32 in v1
+        b.extend_from_slice(&10u32.to_le_bytes());
+        b.extend_from_slice(&20u32.to_le_bytes());
+        b.extend_from_slice(&30u32.to_le_bytes());
+
+        let f = GgufFile::parse(&b).expect("parse v1 array");
+        let GgufValue::Array(arr) = &f.metadata[0].1 else {
+            panic!("expected array");
+        };
+        assert_eq!(arr.elements.len(), 3);
+        assert_eq!(arr.elements[2], GgufValue::Uint32(30));
     }
 
     #[test]
