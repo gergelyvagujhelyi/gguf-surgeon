@@ -278,11 +278,11 @@ mod tests {
     fn rejects_set_on_reserved_key() {
         let mut f = empty_file();
         f.metadata.push((
-            "general.padding".to_string(),
+            "ggufsurgeon.padding".to_string(),
             GgufValue::Uint32(0),
         ));
         let patch =
-            parse_patch(r#"[{"op": "set", "key": "general.padding", "value": 1}]"#).unwrap();
+            parse_patch(r#"[{"op": "set", "key": "ggufsurgeon.padding", "value": 1}]"#).unwrap();
         let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
         assert!(err.contains("managed automatically"), "unexpected err: {err}");
     }
@@ -291,7 +291,7 @@ mod tests {
     fn rejects_add_on_reserved_key() {
         let mut f = empty_file();
         let patch = parse_patch(
-            r#"[{"op": "add", "key": "general.padding", "type": "u32", "value": 1}]"#,
+            r#"[{"op": "add", "key": "ggufsurgeon.padding", "type": "u32", "value": 1}]"#,
         )
         .unwrap();
         let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
@@ -302,10 +302,10 @@ mod tests {
     fn rejects_rm_on_reserved_key() {
         let mut f = empty_file();
         f.metadata.push((
-            "general.padding".to_string(),
+            "ggufsurgeon.padding".to_string(),
             GgufValue::Uint32(0),
         ));
-        let patch = parse_patch(r#"[{"op": "rm", "key": "general.padding"}]"#).unwrap();
+        let patch = parse_patch(r#"[{"op": "rm", "key": "ggufsurgeon.padding"}]"#).unwrap();
         let err = format!("{:#}", apply(&mut f, &patch).unwrap_err());
         assert!(err.contains("managed automatically"), "unexpected err: {err}");
     }

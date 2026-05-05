@@ -20,15 +20,22 @@ use ratatui::{
 
 use crate::diff::Diff;
 use crate::format::{GgufFile, is_reserved_key};
+use crate::schema::{Origin, Schema, Severity, Violation};
 use crate::value::{GgufValue, GgufValueType};
 
 const ARRAY_DETAIL_LIMIT: usize = 200;
 
-pub fn run(path: &Path) -> Result<()> {
+pub fn run(path: &Path, schema: Option<&Schema>, force: bool) -> Result<()> {
     let file = GgufFile::read(path)?;
     let file_size = std::fs::metadata(path)?.len();
 
-    let mut app = App::new(file, path.to_path_buf(), file_size);
+    let mut app = App::new(
+        file,
+        path.to_path_buf(),
+        file_size,
+        schema.cloned(),
+        force,
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -76,6 +83,8 @@ struct App {
     original_metadata: Vec<(String, GgufValue)>,
     path: PathBuf,
     file_size: u64,
+    schema: Option<Schema>,
+    force: bool,
     visible: Vec<usize>,
     cursor: usize,
     list_state: TableState,
@@ -99,7 +108,13 @@ enum Mode {
 }
 
 impl App {
-    fn new(file: GgufFile, path: PathBuf, file_size: u64) -> Self {
+    fn new(
+        file: GgufFile,
+        path: PathBuf,
+        file_size: u64,
+        schema: Option<Schema>,
+        force: bool,
+    ) -> Self {
         let original_metadata = file.metadata.clone();
         let visible: Vec<usize> = file
             .metadata
@@ -117,6 +132,8 @@ impl App {
             original_metadata,
             path,
             file_size,
+            schema,
+            force,
             visible,
             cursor: 0,
             list_state,
@@ -124,6 +141,17 @@ impl App {
             search_buf: String::new(),
             status: None,
         }
+    }
+
+    /// Compute the violations the save flow needs to surface. Format-level
+    /// violations are unconditional; schema-level violations are blocked unless
+    /// `self.force` is set (warnings are reported but never blocking).
+    fn save_violations(&self) -> Vec<Violation> {
+        let mut v = self.file.validate_format();
+        if let Some(s) = self.schema.as_ref().filter(|s| s.applies_to_version(self.file.version)) {
+            v.extend(s.validate(&self.file.metadata));
+        }
+        v
     }
 
     fn dirty(&self) -> bool {
@@ -262,16 +290,27 @@ impl App {
     fn handle_save_confirm(&mut self, code: KeyCode) -> Result<bool> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                // Run the fast format check here so we can short-circuit; the slow
-                // tensor-data copy happens in run_save() once the saving overlay is on screen.
-                let format_violations = self.file.validate_format();
-                let format_errors = format_violations
+                // Fast checks before transitioning into the saving overlay. The slow
+                // tensor-data copy happens in run_save().
+                let violations = self.save_violations();
+                let format_errors = violations
                     .iter()
-                    .filter(|v| v.severity == crate::schema::Severity::Error)
+                    .filter(|v| v.origin == Origin::Format && v.severity == Severity::Error)
                     .count();
                 if format_errors > 0 {
                     self.status = Some(format!(
                         "save blocked by {format_errors} format error(s)"
+                    ));
+                    self.mode = Mode::List;
+                    return Ok(false);
+                }
+                let schema_errors = violations
+                    .iter()
+                    .filter(|v| v.origin == Origin::Schema && v.severity == Severity::Error)
+                    .count();
+                if schema_errors > 0 && !self.force {
+                    self.status = Some(format!(
+                        "save blocked by {schema_errors} schema error(s); pass --force on the CLI"
                     ));
                     self.mode = Mode::List;
                     return Ok(false);
@@ -519,6 +558,21 @@ fn draw_save_confirm(f: &mut ratatui::Frame, app: &App) {
     if lines.is_empty() {
         lines.push(Line::raw("(no changes)"));
     }
+
+    let violations = app.save_violations();
+    if !violations.is_empty() {
+        lines.push(Line::raw(""));
+        for v in &violations {
+            let tag = match (v.origin, v.severity) {
+                (Origin::Format, Severity::Error) => "format-err ",
+                (Origin::Format, Severity::Warning) => "format-warn",
+                (Origin::Schema, Severity::Error) => "schema-err ",
+                (Origin::Schema, Severity::Warning) => "schema-warn",
+            };
+            lines.push(Line::raw(format!("[{tag}] {}: {}", v.key, v.message)));
+        }
+    }
+
     lines.push(Line::raw(""));
     let path = match app.file.predict_save_path(crate::format::DEFAULT_PADDING_STEP) {
         crate::save::SavePath::HeaderOverwrite => "header overwrite (CoW where supported)",

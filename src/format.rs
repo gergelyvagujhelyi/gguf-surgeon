@@ -12,14 +12,23 @@ use crate::version;
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
 const ALIGNMENT_KEY: &str = "general.alignment";
-const PADDING_KEY: &str = "general.padding";
+
+/// Vendor-namespaced sentinel key holding zero-filled padding bytes. Using a
+/// non-spec namespace prevents collisions with metadata that other tools might
+/// legitimately store under a `general.*` name.
+const PADDING_KEY: &str = "ggufsurgeon.padding";
+
+/// Older versions of this editor used `general.padding`. On save we migrate by
+/// stripping any entry under that key whose content looks like ours (a u8 array
+/// of all zeros) — but not foreign content under the same key, which we keep.
+const OLD_PADDING_KEY: &str = "general.padding";
 
 /// Default slack step for the sentinel padding key. The header is grown to a multiple of
 /// this value so subsequent edits within the budget can use the header-overwrite save path.
 pub const DEFAULT_PADDING_STEP: u64 = 64 * 1024;
 
-/// Length in bytes of "general.padding" (the sentinel key name).
-const PADDING_KEY_LEN: u64 = 15;
+/// Length in bytes of "ggufsurgeon.padding" (the sentinel key name).
+const PADDING_KEY_LEN: u64 = 19;
 
 /// Encoded byte overhead of the sentinel padding key itself, given the file version.
 /// (key length prefix + key bytes + value type tag + array element type + array length prefix)
@@ -70,6 +79,19 @@ fn safe_capacity(declared: u64) -> usize {
 /// directly; they are filtered out of user-facing displays.
 pub fn is_reserved_key(key: &str) -> bool {
     key == PADDING_KEY
+}
+
+/// Detect a value that this editor (current or older) wrote as padding: a u8 array
+/// where every element is zero. Used at save time to decide whether the legacy
+/// `general.padding` key holds our slack or foreign data we must preserve.
+fn looks_like_our_padding(value: &GgufValue) -> bool {
+    let GgufValue::Array(a) = value else {
+        return false;
+    };
+    if a.element_type != GgufValueType::Uint8 {
+        return false;
+    }
+    a.elements.iter().all(|e| matches!(e, GgufValue::Uint8(0)))
 }
 
 fn alignment_from_metadata(metadata: &[(String, GgufValue)]) -> u64 {
@@ -151,12 +173,25 @@ impl GgufFile {
         })
     }
 
-    /// Insert (or replace) the `general.padding` sentinel key so the encoded header rounds
-    /// up to a multiple of `step` bytes. This reserves slack for future small edits, which
-    /// can then be saved via the header-overwrite path without copying tensor data.
-    /// Pass `step = 0` to remove any existing padding key.
+    /// Insert (or replace) the `ggufsurgeon.padding` sentinel key so the encoded header
+    /// rounds up to a multiple of `step` bytes. This reserves slack for future small
+    /// edits, which can then be saved via the header-overwrite path without copying
+    /// tensor data. Pass `step = 0` to remove any existing padding key.
+    ///
+    /// Migration: any `general.padding` entry from a previous version of this editor
+    /// is stripped only when its content matches "ours" (a u8 array of all zeros).
+    /// Foreign data under the same key is left untouched — fixing the silent-data-loss
+    /// bug from earlier versions.
     pub fn ensure_padding(&mut self, step: u64) {
-        self.metadata.retain(|(k, _)| k != PADDING_KEY);
+        self.metadata.retain(|(k, v)| {
+            if k == PADDING_KEY {
+                return false; // always strip our own sentinel; we'll re-add it
+            }
+            if k == OLD_PADDING_KEY && looks_like_our_padding(v) {
+                return false; // migrate: strip old-style padding we wrote ourselves
+            }
+            true
+        });
         if step == 0 {
             return;
         }
@@ -790,10 +825,13 @@ mod tests {
     #[test]
     fn is_reserved_key_recognises_padding() {
         assert!(is_reserved_key(PADDING_KEY));
-        assert!(is_reserved_key("general.padding"));
+        assert!(is_reserved_key("ggufsurgeon.padding"));
+        // `general.padding` is no longer reserved — see Bug #2 fix; users with
+        // foreign data under that key can edit it freely.
+        assert!(!is_reserved_key("general.padding"));
         assert!(!is_reserved_key("general.architecture"));
         assert!(!is_reserved_key(""));
-        assert!(!is_reserved_key("general.padding.suffix"));
+        assert!(!is_reserved_key("ggufsurgeon.padding.suffix"));
     }
 
     #[test]

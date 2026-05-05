@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             yes,
         } => patch(&file, &patch_file, yes, &env)?,
         Cmd::Info { file } => info(&file)?,
-        Cmd::Edit { file } => gguf_surgeon::tui::run(&file)?,
+        Cmd::Edit { file } => gguf_surgeon::tui::run(&file, env.schema, env.force)?,
     }
     Ok(())
 }
