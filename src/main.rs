@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use gguf_surgeon::{
     Diff, GgufFile, GgufValue, GgufValueType, Origin, SavePath, Schema, Severity, Violation,
-    apply_patch, is_reserved_key, parse_patch,
+    apply_patch, builtin_schema, is_reserved_key, parse_patch,
 };
 
 #[derive(Parser)]
@@ -80,6 +80,16 @@ enum Cmd {
     },
     /// Print a header summary: version, sizes, alignment, offsets, padding.
     Info { file: PathBuf },
+    /// Inspect the file for likely problems (missing common keys, out-of-range
+    /// values). Runs format-level checks plus the built-in suggestion schema
+    /// and the user `--schema` if provided. Read-only; nothing is written.
+    Check {
+        file: PathBuf,
+        /// Skip the built-in suggestion schema; only run format checks plus any
+        /// explicit `--schema`.
+        #[arg(long)]
+        no_default_schema: bool,
+    },
     /// Open the file in an interactive TUI browser.
     Edit { file: PathBuf },
 }
@@ -121,6 +131,10 @@ fn main() -> Result<()> {
             yes,
         } => patch(&file, &patch_file, yes, &env)?,
         Cmd::Info { file } => info(&file)?,
+        Cmd::Check {
+            file,
+            no_default_schema,
+        } => check(&file, env.schema, !no_default_schema)?,
         Cmd::Edit { file } => gguf_surgeon::tui::run(&file, env.schema, env.force)?,
     }
     Ok(())
@@ -428,6 +442,39 @@ fn confirm_prompt() -> Result<bool> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+fn check(path: &Path, user_schema: Option<&Schema>, use_default: bool) -> Result<()> {
+    let f = GgufFile::read(path)?;
+
+    let mut violations = f.validate_format();
+    if use_default {
+        let default = builtin_schema();
+        if default.applies_to_version(f.version) {
+            violations.extend(default.validate(&f.metadata));
+        }
+    }
+    if let Some(s) = user_schema.filter(|s| s.applies_to_version(f.version)) {
+        violations.extend(s.validate(&f.metadata));
+    }
+
+    if violations.is_empty() {
+        println!("{}: clean", path.display());
+        return Ok(());
+    }
+
+    print_violations(&violations);
+    let errors = violations
+        .iter()
+        .filter(|v| v.severity == Severity::Error)
+        .count();
+    let warnings = violations.len() - errors;
+    println!();
+    println!("{errors} error(s), {warnings} warning(s)");
+    if errors > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn info(path: &Path) -> Result<()> {

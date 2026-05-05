@@ -27,6 +27,7 @@ pub struct Rule {
     pub min_length: Option<usize>,
     pub max_length: Option<usize>,
     pub severity: Option<Severity>,
+    pub required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -73,15 +74,69 @@ impl Schema {
 
     pub fn validate(&self, metadata: &[(String, GgufValue)]) -> Vec<Violation> {
         let mut out = Vec::new();
+
+        // Required-key check: rules that mark a key required produce a violation
+        // when that key is absent from the file's metadata.
+        let present: std::collections::HashSet<&str> =
+            metadata.iter().map(|(k, _)| k.as_str()).collect();
+        for (key, rule) in &self.rules {
+            if rule.required.unwrap_or(false) && !present.contains(key.as_str()) {
+                out.push(Violation {
+                    origin: Origin::Schema,
+                    key: key.clone(),
+                    severity: rule.severity.unwrap_or(Severity::Error),
+                    message: "expected key is missing".to_string(),
+                });
+            }
+        }
+
+        // Per-value checks for keys that are present.
         for (key, value) in metadata {
             if let Some(rule) = self.rules.get(key) {
                 let sev = rule.severity.unwrap_or(Severity::Error);
                 check_rule(key, value, rule, sev, &mut out);
             }
         }
+
         out
     }
 }
+
+/// Built-in default schema: rules that hold for *any* GGUF file regardless of
+/// architecture or quantization. All checks are `severity: warning` so they
+/// surface suggestions without blocking saves. Users can override with
+/// `--schema PATH` (replaces) or simply edit through the warnings.
+pub fn builtin_schema() -> Schema {
+    Schema::parse(BUILTIN_SCHEMA_JSON).expect("built-in schema must be valid")
+}
+
+const BUILTIN_SCHEMA_JSON: &str = r#"{
+    "version": 1,
+    "applies_to": [1, 2, 3],
+    "rules": {
+        "general.architecture": {
+            "type": "string",
+            "required": true,
+            "severity": "warning"
+        },
+        "general.alignment": {
+            "type": "u32",
+            "min": 1,
+            "max": 4096,
+            "severity": "warning"
+        },
+        "general.quantization_version": {
+            "type": "u32",
+            "min": 1,
+            "max": 10,
+            "severity": "warning"
+        },
+        "general.file_type": {
+            "type": "u32",
+            "severity": "warning"
+        }
+    }
+}"#;
 
 fn check_rule(key: &str, value: &GgufValue, rule: &Rule, sev: Severity, out: &mut Vec<Violation>) {
     if let Some(spec) = &rule.type_spec
@@ -317,5 +372,97 @@ mod tests {
         let s = Schema::parse(r#"{ "version": 1, "rules": {} }"#).unwrap();
         let v = s.validate(&[kv("anything", GgufValue::Uint32(0))]);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn required_flag_flags_missing_keys() {
+        let s = Schema::parse(
+            r#"{
+                "version": 1,
+                "rules": {
+                    "general.architecture": {
+                        "type": "string",
+                        "required": true,
+                        "severity": "warning"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let v = s.validate(&[]); // no metadata at all
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].key, "general.architecture");
+        assert_eq!(v[0].severity, Severity::Warning);
+        assert!(v[0].message.contains("missing"));
+    }
+
+    #[test]
+    fn required_flag_passes_when_key_present() {
+        let s = Schema::parse(
+            r#"{
+                "version": 1,
+                "rules": {
+                    "general.architecture": { "required": true }
+                }
+            }"#,
+        )
+        .unwrap();
+        let v = s.validate(&[kv(
+            "general.architecture",
+            GgufValue::String("llama".to_string()),
+        )]);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn builtin_schema_is_valid_and_applies_to_known_versions() {
+        let s = builtin_schema();
+        assert!(s.applies_to_version(1));
+        assert!(s.applies_to_version(2));
+        assert!(s.applies_to_version(3));
+    }
+
+    #[test]
+    fn builtin_schema_flags_missing_general_architecture() {
+        let s = builtin_schema();
+        let v = s.validate(&[]);
+        let arch = v
+            .iter()
+            .find(|v| v.key == "general.architecture")
+            .expect("builtin schema must flag missing general.architecture");
+        assert_eq!(arch.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn builtin_schema_flags_strange_alignment() {
+        let s = builtin_schema();
+        let v = s.validate(&[
+            kv(
+                "general.architecture",
+                GgufValue::String("llama".to_string()),
+            ),
+            kv("general.alignment", GgufValue::Uint32(99999)),
+        ]);
+        let strange = v
+            .iter()
+            .find(|v| v.key == "general.alignment")
+            .expect("builtin schema must flag huge alignment");
+        assert!(strange.message.contains("above max"));
+        assert_eq!(strange.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn builtin_schema_passes_clean_file() {
+        let s = builtin_schema();
+        let v = s.validate(&[
+            kv(
+                "general.architecture",
+                GgufValue::String("llama".to_string()),
+            ),
+            kv("general.alignment", GgufValue::Uint32(32)),
+            kv("general.quantization_version", GgufValue::Uint32(2)),
+            kv("general.file_type", GgufValue::Uint32(1)),
+        ]);
+        assert!(v.is_empty(), "clean file should pass builtin schema, got: {v:?}");
     }
 }

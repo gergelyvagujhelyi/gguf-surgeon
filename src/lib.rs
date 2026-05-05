@@ -13,5 +13,5 @@ pub use error::Error;
 pub use format::{GgufFile, is_reserved_key};
 pub use patch::{Op, Patch, apply as apply_patch, parse_patch};
 pub use save::SavePath;
-pub use schema::{Origin, Rule, Schema, Severity, Violation};
+pub use schema::{Origin, Rule, Schema, Severity, Violation, builtin_schema};
 pub use value::{GgufArray, GgufValue, GgufValueType};
