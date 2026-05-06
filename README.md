@@ -1,5 +1,11 @@
 # gguf-surgeon
 
+> [!IMPORTANT]
+> **This repository has moved.** Active development continues at
+> **[nobodywho-ooo/gguf-surgeon](https://github.com/nobodywho-ooo/gguf-surgeon)**.
+> Please file issues, pull requests, and discussions there. This copy is kept
+> read-only as a historical mirror.
+
 Surgical metadata edits for GGUF model files: browse the key/value metadata stored in a `.gguf` file and modify fields in place without touching the tensor data.
 
 ## Background
